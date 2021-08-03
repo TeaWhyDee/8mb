@@ -1,21 +1,73 @@
-#/bin/bash
-#set -o xtrace
+#!/bin/bash
 targetSizeKilobytes=8192
 fileInput=$1
-ext="${fileInput##*.}"; 
-fileOutput="${fileInput}.shrunk.${ext}"
+filename=$(echo $fileInput | sed -E "s/(.*)\..*/\1/")
+outFormat="mp4"
+while [ "$1" != "" ]; do
+    case $1 in
+        -f | --format )
+            shift 
+            outFormat=$1
+            ;;
+        -h | --help )
+            echo "
+    -f | --format FORMAT (out file extension)
+            "
+            exit
+    esac
+    shift
+done
+
+outScale=1
+fileOutput="${filename}_shrunk.${outFormat}"
+inFPS=$(ffprobe -v 0 -of csv=p=0 -select_streams v:0 -show_entries stream=r_frame_rate vernambasement2.mp4 | xargs echo "scale=0;" | bc)
+outFPS=$inFPS
 durationSeconds=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $fileInput)
 bitrate=$(echo "scale=0; $targetSizeKilobytes/ $durationSeconds" | bc)
-#bitrate=$(($targetSizeKilobytes / $durationSeconds))
-beforeSizeBytes=$(stat --printf="%s" $fileInput)
-echo "Shrinking ${fileInput} to ${targetSizeKilobytes}KB. Bitrate: ${bitrate}k"
-ffmpeg \
-	-y \
-	-hide_banner \
-	-loglevel error \
-	-i "$fileInput" \
-	-b ${bitrate}k \
-	$fileOutput
+inWidth=$(ffprobe -v quiet -print_format json -show_format -show_streams vernambasement2.mp4 | jq '.streams | map(select(.codec_type == "video")) | .[].width')
+pixels=$(ffprobe -v quiet -print_format json -show_format -show_streams vernambasement2.mp4 | jq '.streams | map(select(.codec_type == "video")) | .[].width, .[].height' | paste -s -d"*" | bc)
+audioBitrateKB=$(ffprobe -v quiet -print_format json -show_format -show_streams vernambasement2.mp4 | jq '.streams | map(select(.codec_type == "audio")) | .[].bit_rate ' | xargs -I {} echo "scale=2; {}/8/1000" | bc)
+if [[ $bitrate < 200 ]] ; then 
+    if [[ $inFPS > 50 ]] ; then 
+        outFPS=42 
+        echo New fps: $outFPS >&2
+    fi 
+    if [[ $pixels > 1500000 ]] ; then 
+        outScale=$(printf "921600/$pixels" | calc -p -d )
+        echo pixels: $pixels >&2
+        echo Out scale: $outScale >&2
+        outWidth=$(echo "$inWidth*$outScale" | calc -p -d | sed 's/\..*//')
+        echo New width: $outWidth >&2
+        if [[ $(echo "scale=0; $outWidth % 2" | bc) -eq 1 ]] ; then
+            outWidth=$(echo "$outWidth+1" | bc)
+        fi
+    fi 
+fi
+# if [[ $bitrate < 150 ]] ; then 
+#     if [[ $inFPS > 35 ]] ; then 
+#         outFPS=30 
+#         echo New fps: $outFPS >&2
+#     fi 
+#     if [[ $pixels > 500000 ]] ; then 
+#         outScale=$(echo "345600/$pixels" | bc | xargs -I {} echo "0{}")
+#         outWidth=$(echo "$inWidth*$outScale")
+#         if [[ $(echo "scale=0; $outWidth % 2" | bc) -eq 1 ]] ; then
+#             outWidth=$(echo "$outWidth+1" | bc)
+#         fi
+#         echo New width: $outWidth >&2
+#     fi 
+# fi
+echo "Shrinking ${fileInput} to ${targetSizeKilobytes}KB. Bitrate: ${bitrate}KB"
+ffmpeg -y \
+	-hide_banner -v warning -stats \
+  -i "$fileInput" \
+  -b ${bitrate}KB \
+  -r $outFPS \
+  -vf "scale=$outWidth:-1" \
+  $fileOutput
+	# -loglevel error
 afterSizeBytes=$(stat --printf="%s" $fileOutput)
-shrinkPercentage=$(($beforeSizeBytes / $afterSizeBytes))
-echo "Rebuilt file as ${fileOutput}, shrank to ${shrinkPercentage}% of original size"
+beforeSizeBytes=$(stat --printf="%s" $fileInput)
+echo $beforeSizeBytes $afterSizeBytes
+shrinkFactor=$(echo "scale=2; $afterSizeBytes / $beforeSizeBytes" | bc )
+echo "Rebuilt file as ${fileOutput}, shrank to ${shrinkFactor} of original size"
